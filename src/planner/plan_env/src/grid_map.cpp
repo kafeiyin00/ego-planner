@@ -1,5 +1,12 @@
 #include "plan_env/grid_map.h"
 
+/*
+ * 本文件中的地图更新流水线：
+ * - 传感器回调缓存最新的“深度图/点云”和“位姿/里程计”。
+ * - 定时器回调执行：投影 -> 射线融合 -> 障碍膨胀。
+ * - 规划器通过膨胀占据图进行碰撞查询。
+ */
+
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
 
@@ -7,7 +14,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
 {
   node_ = nh;
 
-  /* get parameter */
+  /* 1) 读取参数 */
   double x_size, y_size, z_size;
   node_.param("grid_map/resolution", mp_.resolution_, -1.0);
   node_.param("grid_map/map_size_x", x_size, -1.0);
@@ -72,7 +79,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
   mp_.map_min_boundary_ = mp_.map_origin_;
   mp_.map_max_boundary_ = mp_.map_origin_ + mp_.map_size_;
 
-  // initialize data buffers
+  /* 2) 计算地图边界并分配运行时缓存 */
 
   int buffer_size = mp_.map_voxel_num_(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2);
 
@@ -93,7 +100,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
       0.0, -1.0, 0.0, -0.02,
       0.0, 0.0, 0.0, 1.0;
 
-  /* init callback */
+  /* 3) 注册输入回调 */
 
   depth_sub_.reset(new message_filters::Subscriber<sensor_msgs::Image>(node_, "/grid_map/depth", 50));
 
@@ -115,12 +122,13 @@ void GridMap::initMap(ros::NodeHandle &nh)
     sync_image_odom_->registerCallback(boost::bind(&GridMap::depthOdomCallback, this, _1, _2));
   }
 
-  // use odometry and point cloud
+  // 点云输入路径（与深度图输入路径并行）。
   indep_cloud_sub_ =
       node_.subscribe<sensor_msgs::PointCloud2>("/grid_map/cloud", 10, &GridMap::cloudCallback, this);
   indep_odom_sub_ =
       node_.subscribe<nav_msgs::Odometry>("/grid_map/odom", 10, &GridMap::odomCallback, this);
 
+  /* 4) 注册周期处理与可视化发布 */
   occ_timer_ = node_.createTimer(ros::Duration(0.05), &GridMap::updateOccupancyCallback, this);
   vis_timer_ = node_.createTimer(ros::Duration(0.05), &GridMap::visCallback, this);
 
@@ -167,7 +175,7 @@ void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
   boundIndex(min_id);
   boundIndex(max_id);
 
-  /* reset occ and dist buffer */
+  /* 重置膨胀占据缓冲 */
   for (int x = min_id(0); x <= max_id(0); ++x)
     for (int y = min_id(1); y <= max_id(1); ++y)
       for (int z = min_id(2); z <= max_id(2); ++z)
@@ -200,7 +208,8 @@ int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
 
 void GridMap::projectDepthImage()
 {
-  // md_.proj_points_.clear();
+  // 将有效深度像素投影为世界坐标点，用于后续射线投射。
+  // md_.proj_points_.clear();  // 也可用 clear，这里采用计数器复用内存
   md_.proj_points_cnt = 0;
 
   uint16_t *row_ptr;
@@ -212,8 +221,8 @@ void GridMap::projectDepthImage()
 
   Eigen::Matrix3d camera_r = md_.camera_q_.toRotationMatrix();
 
-  // cout << "rotate: " << md_.camera_q_.toRotationMatrix() << endl;
-  // std::cout << "pos in proj: " << md_.camera_pos_ << std::endl;
+  // cout << "旋转矩阵: " << md_.camera_q_.toRotationMatrix() << endl;
+  // std::cout << "投影时相机位置: " << md_.camera_pos_ << std::endl;
 
   if (!mp_.use_depth_filter_)
   {
@@ -238,7 +247,7 @@ void GridMap::projectDepthImage()
       }
     }
   }
-  /* use depth filter */
+  /* 启用深度滤波 */
   else
   {
 
@@ -263,7 +272,7 @@ void GridMap::projectDepthImage()
           depth = (*row_ptr) * inv_factor;
           row_ptr = row_ptr + mp_.skip_pixel_;
 
-          // filter depth
+          // 深度值滤波
           // depth += rand_noise_(eng_);
           // if (depth > 0.01) depth += rand_noise2_(eng_);
 
@@ -280,7 +289,7 @@ void GridMap::projectDepthImage()
             depth = mp_.max_ray_length_ + 0.1;
           }
 
-          // project to world frame
+          // 投影到世界坐标系
           pt_cur(0) = (u - mp_.cx_) * depth / mp_.fx_;
           pt_cur(1) = (v - mp_.cy_) * depth / mp_.fy_;
           pt_cur(2) = depth;
@@ -292,7 +301,7 @@ void GridMap::projectDepthImage()
 
           md_.proj_points_[md_.proj_points_cnt++] = pt_world;
 
-          // check consistency with last image, disabled...
+          // 与上一帧做一致性检查（当前关闭）...
           if (false)
           {
             pt_reproj = last_camera_r_inv * (pt_world - md_.last_camera_pos_);
@@ -317,7 +326,7 @@ void GridMap::projectDepthImage()
     }
   }
 
-  /* maintain camera pose for consistency check */
+  /* 维护上一帧相机位姿与深度图（用于一致性检查） */
 
   md_.last_camera_pos_ = md_.camera_pos_;
   md_.last_camera_q_ = md_.camera_q_;
@@ -326,18 +335,26 @@ void GridMap::projectDepthImage()
 
 void GridMap::raycastProcess()
 {
-  // if (md_.proj_points_.size() == 0)
+  /*
+   * 功能概览：
+   * 1) 对当前帧投影点执行 raycast，得到“命中/未命中”统计；
+   * 2) 更新本帧局部更新边界（local_bound_min_/max_）；
+   * 3) 将统计结果融合到 occupancy_buffer_（log-odds 占据图）。
+   */
+
+  // 当前帧没有任何投影点时，无需更新。
   if (md_.proj_points_cnt == 0)
     return;
 
   ros::Time t1, t2;
 
+  // 本帧编号 +1。flag_rayend_/flag_traverse_ 用它做“帧内去重”。
   md_.raycast_num_ += 1;
 
   int vox_idx;
   double length;
 
-  // bounding box of updated region
+  // 初始化本帧更新包围盒（后续通过 min/max 不断收紧/扩张）。
   double min_x = mp_.map_max_boundary_(0);
   double min_y = mp_.map_max_boundary_(1);
   double min_z = mp_.map_max_boundary_(2);
@@ -350,11 +367,20 @@ void GridMap::raycastProcess()
   Eigen::Vector3d half = Eigen::Vector3d(0.5, 0.5, 0.5);
   Eigen::Vector3d ray_pt, pt_w;
 
+  /* ===== A. 遍历每个投影点，先收集 hit/miss 证据 ===== */
   for (int i = 0; i < md_.proj_points_cnt; ++i)
   {
     pt_w = md_.proj_points_[i];
 
-    // set flag for projected point
+    /*
+     * 先确定“射线终点体素”的证据类型：
+     * - 点在图外：先裁剪到地图边界，再按 max_ray_length 截断，记为 miss；
+     * - 点在图内但超出 max_ray_length：截断后记为 miss；
+     * - 点在图内且在量程内：记为 hit。
+     *
+     * 注意：这里写入的是缓存计数，不直接改 occupancy_buffer_。
+     * 这样可把同一帧重复观测统一到后续融合阶段处理。
+     */
 
     if (!isInMap(pt_w))
     {
@@ -382,6 +408,7 @@ void GridMap::raycastProcess()
       }
     }
 
+    // 用终点（可能已裁剪）更新本帧包围盒。
     max_x = max(max_x, pt_w(0));
     max_y = max(max_y, pt_w(1));
     max_z = max(max_z, pt_w(2));
@@ -390,10 +417,14 @@ void GridMap::raycastProcess()
     min_y = min(min_y, pt_w(1));
     min_z = min(min_z, pt_w(2));
 
-    // raycasting between camera center and point
+    /*
+     * 相机中心 -> 终点 做射线步进：
+     * 射线路径上的体素都加入 miss（自由空间）证据。
+     */
 
     if (vox_idx != INVALID_IDX)
     {
+      // 同一帧内同一终点体素只处理一次，减少重复计算。
       if (md_.flag_rayend_[vox_idx] == md_.raycast_num_)
       {
         continue;
@@ -408,15 +439,18 @@ void GridMap::raycastProcess()
 
     while (raycaster.step(ray_pt))
     {
+      // ray_pt 是网格索引坐标，转换为体素中心点坐标。
       Eigen::Vector3d tmp = (ray_pt + half) * mp_.resolution_;
       length = (tmp - md_.camera_pos_).norm();
 
       // if (length < mp_.min_ray_length_) break;
 
+      // 路径体素记为 miss 证据。
       vox_idx = setCacheOccupancy(tmp, 0);
 
       if (vox_idx != INVALID_IDX)
       {
+        // 同一帧内若再次走到该体素，可提前结束该射线，避免冗余。
         if (md_.flag_traverse_[vox_idx] == md_.raycast_num_)
         {
           break;
@@ -429,6 +463,8 @@ void GridMap::raycastProcess()
     }
   }
 
+  /* ===== B. 更新本帧局部边界 ===== */
+  // 相机位置也纳入包围盒，保证相机附近区域被覆盖。
   min_x = min(min_x, md_.camera_pos_(0));
   min_y = min(min_y, md_.camera_pos_(1));
   min_z = min(min_z, md_.camera_pos_(2));
@@ -438,6 +474,7 @@ void GridMap::raycastProcess()
   max_z = max(max_z, md_.camera_pos_(2));
   max_z = max(max_z, mp_.ground_height_);
 
+  // 转索引并裁剪到地图范围，供后续 clear+inflate 阶段使用。
   posToIndex(Eigen::Vector3d(max_x, max_y, max_z), md_.local_bound_max_);
   posToIndex(Eigen::Vector3d(min_x, min_y, min_z), md_.local_bound_min_);
   boundIndex(md_.local_bound_min_);
@@ -445,7 +482,8 @@ void GridMap::raycastProcess()
 
   md_.local_updated_ = true;
 
-  // update occupancy cached in queue
+  /* ===== C. 将缓存统计融合到 occupancy_buffer_ ===== */
+  // 只保留相机附近 local_update_range_ 区域作为“活跃更新区”。
   Eigen::Vector3d local_range_min = md_.camera_pos_ - mp_.local_update_range_;
   Eigen::Vector3d local_range_max = md_.camera_pos_ + mp_.local_update_range_;
 
@@ -455,20 +493,27 @@ void GridMap::raycastProcess()
   boundIndex(min_id);
   boundIndex(max_id);
 
-  // std::cout << "cache all: " << md_.cache_voxel_.size() << std::endl;
+  // std::cout << "缓存体素总数: " << md_.cache_voxel_.size() << std::endl;
 
+  // 逐体素消费缓存队列：每个体素在本帧只会入队一次。
   while (!md_.cache_voxel_.empty())
   {
-
     Eigen::Vector3i idx = md_.cache_voxel_.front();
     int idx_ctns = toAddress(idx);
     md_.cache_voxel_.pop();
 
+    /*
+     * 多数票策略决定更新方向：
+     * - hit 次数 >= miss 次数 -> 使用 prob_hit_log_（趋向占据）；
+     * - 否则                 -> 使用 prob_miss_log_（趋向空闲）。
+     */
     double log_odds_update =
         md_.count_hit_[idx_ctns] >= md_.count_hit_and_miss_[idx_ctns] - md_.count_hit_[idx_ctns] ? mp_.prob_hit_log_ : mp_.prob_miss_log_;
 
+    // 统计量已消费，清零等待下一帧。
     md_.count_hit_[idx_ctns] = md_.count_hit_and_miss_[idx_ctns] = 0;
 
+    // 上下限饱和保护：避免反复越界更新。
     if (log_odds_update >= 0 && md_.occupancy_buffer_[idx_ctns] >= mp_.clamp_max_log_)
     {
       continue;
@@ -479,6 +524,7 @@ void GridMap::raycastProcess()
       continue;
     }
 
+    // 不在活跃更新区的体素直接拉回 free（维持局部地图时效性）。
     bool in_local = idx(0) >= min_id(0) && idx(0) <= max_id(0) && idx(1) >= min_id(1) &&
                     idx(1) <= max_id(1) && idx(2) >= min_id(2) && idx(2) <= max_id(2);
     if (!in_local)
@@ -486,6 +532,7 @@ void GridMap::raycastProcess()
       md_.occupancy_buffer_[idx_ctns] = mp_.clamp_min_log_;
     }
 
+    // 应用增量并裁剪到允许范围 [clamp_min_log_, clamp_max_log_]。
     md_.occupancy_buffer_[idx_ctns] =
         std::min(std::max(md_.occupancy_buffer_[idx_ctns] + log_odds_update, mp_.clamp_min_log_),
                  mp_.clamp_max_log_);
@@ -520,7 +567,8 @@ Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen
 
 void GridMap::clearAndInflateLocalMap()
 {
-  /*clear outside local*/
+  // 仅保留局部活动区域，并对占据体素做安全裕度膨胀。
+  /* 清理局部区域外的数据 */
   const int vec_margin = 5;
   // Eigen::Vector3i min_vec_margin = min_vec - Eigen::Vector3i(vec_margin,
   // vec_margin, vec_margin); Eigen::Vector3i max_vec_margin = max_vec +
@@ -538,7 +586,7 @@ void GridMap::clearAndInflateLocalMap()
   boundIndex(min_cut_m);
   boundIndex(max_cut_m);
 
-  // clear data outside the local range
+  // 清理局部范围外的数据
 
   for (int x = min_cut_m(0); x <= max_cut_m(0); ++x)
     for (int y = min_cut_m(1); y <= max_cut_m(1); ++y)
@@ -591,7 +639,7 @@ void GridMap::clearAndInflateLocalMap()
       }
     }
 
-  // inflate occupied voxels to compensate robot size
+  // 对占据体素膨胀，以补偿机体体积
 
   int inf_step = ceil(mp_.obstacles_inflation_ / mp_.resolution_);
   // int inf_step_z = 1;
@@ -599,7 +647,7 @@ void GridMap::clearAndInflateLocalMap()
   // inf_pts.resize(4 * inf_step + 3);
   Eigen::Vector3i inf_pt;
 
-  // clear outdated data
+  // 清除过期膨胀数据
   for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
     for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
       for (int z = md_.local_bound_min_(2); z <= md_.local_bound_max_(2); ++z)
@@ -607,7 +655,7 @@ void GridMap::clearAndInflateLocalMap()
         md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 0;
       }
 
-  // inflate obstacles
+  // 执行障碍膨胀
   for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
     for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
       for (int z = md_.local_bound_min_(2); z <= md_.local_bound_max_(2); ++z)
@@ -631,7 +679,7 @@ void GridMap::clearAndInflateLocalMap()
         }
       }
 
-  // add virtual ceiling to limit flight height
+  // 通过添加“虚拟天花板”占据层，限制最大飞行高度。
   if (mp_.virtual_ceil_height_ > -0.5)
   {
     int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_);
@@ -645,17 +693,18 @@ void GridMap::clearAndInflateLocalMap()
 
 void GridMap::visCallback(const ros::TimerEvent & /*event*/)
 {
-
+  // 发布原始占据图与膨胀占据图（调试可视化）。
   publishMap();
   publishMapInflate(true);
 }
 
 void GridMap::updateOccupancyCallback(const ros::TimerEvent & /*event*/)
 {
+  // 主周期更新：投影 -> 射线融合 -> 膨胀。
   if (!md_.occ_need_update_)
     return;
 
-  /* update occupancy */
+  /* 更新占据地图 */
   // ros::Time t1, t2, t3, t4;
   // t1 = ros::Time::now();
 
@@ -686,7 +735,8 @@ void GridMap::updateOccupancyCallback(const ros::TimerEvent & /*event*/)
 void GridMap::depthPoseCallback(const sensor_msgs::ImageConstPtr &img,
                                 const geometry_msgs::PoseStampedConstPtr &pose)
 {
-  /* get depth image */
+  // 深度图 + 位姿 输入路径（位姿已在世界坐标系）。
+  /* 读取深度图 */
   cv_bridge::CvImagePtr cv_ptr;
   cv_ptr = cv_bridge::toCvCopy(img, img->encoding);
 
@@ -696,9 +746,9 @@ void GridMap::depthPoseCallback(const sensor_msgs::ImageConstPtr &img,
   }
   cv_ptr->image.copyTo(md_.depth_image_);
 
-  // std::cout << "depth: " << md_.depth_image_.cols << ", " << md_.depth_image_.rows << std::endl;
+  // std::cout << "深度图尺寸: " << md_.depth_image_.cols << ", " << md_.depth_image_.rows << std::endl;
 
-  /* get pose */
+  /* 读取位姿 */
   md_.camera_pos_(0) = pose->pose.position.x;
   md_.camera_pos_(1) = pose->pose.position.y;
   md_.camera_pos_(2) = pose->pose.position.z;
@@ -717,6 +767,7 @@ void GridMap::depthPoseCallback(const sensor_msgs::ImageConstPtr &img,
 }
 void GridMap::odomCallback(const nav_msgs::OdometryConstPtr &odom)
 {
+  // 在第一帧深度图到来前，仅使用里程计更新位姿状态。
   if (md_.has_first_depth_)
     return;
 
@@ -729,6 +780,7 @@ void GridMap::odomCallback(const nav_msgs::OdometryConstPtr &odom)
 
 void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
 {
+  // 点云输入路径：直接在点周围写入局部膨胀占据。
 
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
   pcl::fromROSMsg(*img, latest_cloud);
@@ -771,7 +823,7 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
     pt = latest_cloud.points[i];
     p3d(0) = pt.x, p3d(1) = pt.y, p3d(2) = pt.z;
 
-    /* point inside update range */
+  /* 点在局部更新范围内 */
     Eigen::Vector3d devi = p3d - md_.camera_pos_;
     Eigen::Vector3i inf_pt;
 
@@ -779,7 +831,7 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
         fabs(devi(2)) < mp_.local_update_range_(2))
     {
 
-      /* inflate the point */
+      /* 对该点执行膨胀 */
       for (int x = -inf_step; x <= inf_step; ++x)
         for (int y = -inf_step; y <= inf_step; ++y)
           for (int z = -inf_step_z; z <= inf_step_z; ++z)
@@ -828,7 +880,7 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
 
 void GridMap::publishMap()
 {
-
+  // 发布 occupancy_buffer_（原始占据缓冲）中的占据体素。
   if (map_pub_.getNumSubscribers() <= 0)
     return;
 
@@ -874,7 +926,7 @@ void GridMap::publishMap()
 
 void GridMap::publishMapInflate(bool all_info)
 {
-
+  // 发布规划器实际使用的二值膨胀障碍图。
   if (map_inf_pub_.getNumSubscribers() <= 0)
     return;
 
@@ -921,11 +973,12 @@ void GridMap::publishMapInflate(bool all_info)
   pcl::toROSMsg(cloud, cloud_msg);
   map_inf_pub_.publish(cloud_msg);
 
-  // ROS_INFO("pub map");
+  // ROS_INFO("发布地图");
 }
 
 void GridMap::publishUnknown()
 {
+  // 发布未知体素（未被观测）用于地图调试。
   pcl::PointXYZ pt;
   pcl::PointCloud<pcl::PointXYZ> cloud;
 
@@ -982,7 +1035,9 @@ void GridMap::getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size)
 void GridMap::depthOdomCallback(const sensor_msgs::ImageConstPtr &img,
                                 const nav_msgs::OdometryConstPtr &odom)
 {
-  /* get pose */
+  // 深度图 + 里程计 输入路径：
+  // 先通过 cam2body_ 将机体系位姿变换到相机位姿。
+  /* 读取位姿 */
   Eigen::Quaterniond body_q = Eigen::Quaterniond(odom->pose.pose.orientation.w,
                                                  odom->pose.pose.orientation.x,
                                                  odom->pose.pose.orientation.y,
@@ -1001,7 +1056,7 @@ void GridMap::depthOdomCallback(const sensor_msgs::ImageConstPtr &img,
   md_.camera_pos_(2) = cam_T(2, 3);
   md_.camera_q_ = Eigen::Quaterniond(cam_T.block<3, 3>(0, 0));
 
-  /* get depth image */
+  /* 读取深度图 */
   cv_bridge::CvImagePtr cv_ptr;
   cv_ptr = cv_bridge::toCvCopy(img, img->encoding);
   if (img->encoding == sensor_msgs::image_encodings::TYPE_32FC1)
